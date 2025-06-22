@@ -374,12 +374,70 @@ async fn health_check() -> Result<ResponseJson<serde_json::Value>, StatusCode> {
     })))
 }
 
+async fn start_server_without_db() -> Result<(), Box<dyn std::error::Error>> {
+    // Create minimal app without database operations
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/ml-auth-analysis", post(ml_authentication_analysis))
+        .route("/payment-subscription", post(payment_subscription))
+        .route("/solana-payment", post(solana_payment))
+        .layer(CorsLayer::permissive());
+
+    println!("🌟 Server starting on 0.0.0.0:5000 (NO DATABASE MODE)");
+    println!("📋 Available endpoints:");
+    println!("   GET  /health              - Health check");
+    println!("   POST /ml-auth-analysis    - ML authentication analysis");
+    println!("   POST /payment-subscription - Payment processing");
+    println!("   POST /solana-payment      - Solana payment processing");
+    
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:5000").await?;
+    serve(listener, app).await?;
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Database connection
+    // Load environment variables from .env file
+    dotenv::dotenv().ok();
+    
+    // Check if we should skip database connection for development
+    let skip_db = std::env::var("SKIP_DATABASE").unwrap_or_default() == "true";
+    
+    if skip_db {
+        println!("⚠️  SKIP_DATABASE=true - Running without database connection!");
+        println!("🚀 Server will start but database operations will fail.");
+        println!("💡 To enable database: Remove SKIP_DATABASE or set it to false");
+        
+        return start_server_without_db().await;
+    }
+    
+    // Database connection with timeout and retry logic
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost/auth_db".to_string());
-    let pool = PgPool::connect(&database_url).await?;
+    
+    println!("Attempting to connect to database: {}", database_url);
+    
+    let pool_result = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(&database_url)
+        .await;
+    
+    let pool = match pool_result {
+        Ok(pool) => {
+            println!("✅ Database connected successfully!");
+            pool
+        },
+        Err(e) => {
+            eprintln!("❌ Database connection failed: {}", e);
+            eprintln!("💡 To run without database, set SKIP_DATABASE=true in .env");
+            eprintln!("🐘 To fix: Ensure PostgreSQL is running and create database:");
+            eprintln!("   sudo systemctl start postgresql");
+            eprintln!("   createdb auth_db");
+            return Err(e.into());
+        }
+    };
 
     // Redis connection
     let redis_url = std::env::var("REDIS_URL")
