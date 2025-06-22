@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 use jsonwebtoken::{encode, Header, EncodingKey};
-use totp_rs::{Algorithm as TotpAlgorithm, Secret, TOTP};
+use totp_rs::{Algorithm as TotpAlgorithm, TOTP};
 use tokio::sync::broadcast;
 use chrono::{Utc, Duration};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::Rng;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
 struct User {
     id: Option<i32>,
     email: String,
@@ -67,6 +67,12 @@ struct NotificationRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct Enable2FARequest {
+    user_id: i32,
+    email: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct PaymentRequest {
     user_id: i32,
     amount: f64,
@@ -96,11 +102,10 @@ async fn login(
     Json(payload): Json<LoginRequest>
 ) -> Result<ResponseJson<AuthResponse>, StatusCode> {
     // Verify user credentials
-    let user_query = sqlx::query_as!(
-        User,
-        "SELECT id, email, password_hash, avatar_url, role, two_factor_secret, webauthn_credential, created_at FROM users WHERE email = $1",
-        payload.email
+    let user_query = sqlx::query_as::<_, User>(
+        "SELECT id, email, password_hash, avatar_url, role, two_factor_secret, webauthn_credential, created_at FROM users WHERE email = $1"
     )
+    .bind(&payload.email)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -165,13 +170,12 @@ async fn register(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Insert user into database
-    let user = sqlx::query_as!(
-        User,
-        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, password_hash, avatar_url, role, two_factor_secret, webauthn_credential, created_at",
-        payload.email,
-        password_hash,
-        payload.role.unwrap_or_else(|| "user".to_string())
+    let user = sqlx::query_as::<_, User>(
+        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, password_hash, avatar_url, role, two_factor_secret, webauthn_credential, created_at"
     )
+    .bind(&payload.email)
+    .bind(&password_hash)
+    .bind(&payload.role.unwrap_or_else(|| "user".to_string()))
     .fetch_one(&state.db)
     .await
     .map_err(|_| StatusCode::CONFLICT)?;
@@ -204,13 +208,15 @@ async fn register(
 
 async fn enable_2fa(
     State(state): State<AppState>,
-    Json(user): Json<User>
+    Json(request): Json<Enable2FARequest>
 ) -> Result<ResponseJson<serde_json::Value>, StatusCode> {
-    let mut rng = rand::thread_rng();
-    let secret: [u8; 20] = rng.gen();
+    use rand::RngCore;
+    
+    let mut secret = [0u8; 20];
+    rand::thread_rng().fill_bytes(&mut secret);
     let secret_base64 = BASE64.encode(secret);
 
-    let totp = TOTP::new(
+    let _totp = TOTP::new(
         TotpAlgorithm::SHA1,
         6,
         1,
@@ -219,20 +225,24 @@ async fn enable_2fa(
     ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Update user with 2FA secret
-    sqlx::query!(
-        "UPDATE users SET two_factor_secret = $1 WHERE id = $2",
-        secret_base64,
-        user.id
+    sqlx::query(
+        "UPDATE users SET two_factor_secret = $1 WHERE id = $2"
     )
+    .bind(&secret_base64)
+    .bind(&request.user_id)
     .execute(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let qr_code_url = totp.get_qr().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Generate QR code URL manually
+    let qr_code_url = format!(
+        "otpauth://totp/UserRoom:{}?secret={}&issuer=UserRoom",
+        request.email, secret_base64
+    );
 
     Ok(ResponseJson(serde_json::json!({
         "message": "2FA enabled successfully",
-        "qr_code": BASE64.encode(&qr_code_url),
+        "qr_code": qr_code_url,
         "secret": secret_base64
     })))
 }
@@ -272,7 +282,7 @@ async fn payment_subscription(
     println!("Processing subscription payment for user {}", payment.user_id);
 
     // Simulate payment processing
-    let payment_id = format!("pay_{}", rand::thread_rng().gen::<u32>());
+    let payment_id = format!("pay_{}", rand::thread_rng().r#gen::<u32>());
 
     Ok(ResponseJson(serde_json::json!({
         "message": "Subscription payment processed",
@@ -291,7 +301,7 @@ async fn solana_payment(
     println!("Processing payment via Solana for user {}", payment.user_id);
 
     // Simulate transaction hash
-    let transaction_id = format!("solana_tx_{}", rand::thread_rng().gen::<u32>());
+    let transaction_id = format!("solana_tx_{}", rand::thread_rng().r#gen::<u32>());
 
     Ok(ResponseJson(serde_json::json!({
         "message": "Payment processed via Solana",
